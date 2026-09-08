@@ -67,6 +67,106 @@ job log.
 
 ---
 
+## Testing before you go live
+
+Work through these in order. Each stage adds one new failure mode, so if
+something breaks you know exactly what caused it.
+
+### Stage 1 — Scraper only, no Telegram, no secrets
+
+```bash
+pip install -r requirements.txt
+python -m unittest discover -s tests -v   # 19 tests, offline
+DRY_RUN=1 python -m pulsebot.main         # hits Pulse, prints, sends nothing
+```
+
+The dry run should print a few rendered messages. This proves Pulse is
+reachable and the markup still parses.
+
+### Stage 2 — Preflight the whole chain
+
+```bash
+export TELEGRAM_BOT_TOKEN='...'
+export TELEGRAM_CHAT_ID='@yourchannel'
+python -m pulsebot.verify
+```
+
+Checks, in order: Pulse is reachable and parses; the token authenticates;
+the channel exists; **the bot is an admin that may actually post**. That last
+one is the most common setup mistake and the API only tells you at send time
+otherwise.
+
+Add `--send` to post one real test message to the channel:
+
+```bash
+python -m pulsebot.verify --send
+```
+
+### Stage 3 — A throwaway channel first
+
+Point `TELEGRAM_CHAT_ID` at a private test channel and run the real thing:
+
+```bash
+python -m pulsebot.main   # first run: seeds, posts nothing
+python -m pulsebot.main   # second run onward: posts new articles
+```
+
+Wait ~10 minutes between the second and third run and confirm you get a
+small number of genuinely new articles, with no repeats. Repeats mean state
+isn't persisting; check `state/seen.json` is being written.
+
+### Stage 4 — GitHub Actions, still on the test channel
+
+Push, add the secrets, then **Actions → Pulse to Telegram → Run workflow**:
+
+1. Run once with **dry_run** ticked. Read the log — nothing is sent.
+2. Run again normally. This seeds; a `state` branch appears.
+3. Run a third time. Real posts land in the test channel.
+
+Confirm the `state` branch exists and holds `seen.json` with a few hundred
+ids. If it doesn't, the save step failed — check the log for a push error.
+
+### Stage 5 — Go live
+
+Swap `TELEGRAM_CHAT_ID` to the real channel, delete the `state` branch so it
+re-seeds cleanly against the new channel, and let the schedule take over.
+
+> Deleting the `state` branch matters: state carried over from the test
+> channel would suppress articles the real channel has never seen.
+
+---
+
+## Running in production
+
+### Knowing when it breaks
+
+GitHub emails you when a scheduled workflow fails, but **only for hard
+failures**. Two silent modes are worth knowing:
+
+- **Pulse changed its markup.** The scraper deliberately raises rather than
+  posting nothing, so this surfaces as a failed run and an email. Working as
+  intended.
+- **The schedule stopped.** GitHub disables scheduled workflows after
+  **60 days of repository inactivity** (it emails first), and silently skips
+  runs under heavy load. If the channel goes quiet, check the Actions tab
+  before suspecting the code.
+
+A simple health check: if nothing has posted in ~3 hours during Indian market
+hours, something is wrong — Pulse publishes ~13 articles/hour.
+
+### Cost
+
+Public repo: free. Private repo: see the warning at the top of this file.
+
+### Tuning
+
+If the channel feels too noisy once it's live, the cheapest fix is filtering
+by source in `pulsebot/main.py` — Pulse only carries 5 (The Hindu Business,
+Economic Times, NDTV Business, Business Standard, Finshots), so dropping one
+or two meaningfully cuts volume.
+
+---
+
 ## How it works
 
 `pulse.zerodha.com` is fully server-rendered: one `GET` returns ~300 articles covering the
@@ -192,6 +292,7 @@ pulsebot/
   state.py      bounded seen-id set, persisted as JSON
   config.py     environment-variable configuration
   main.py       entry point: scrape → diff → post → persist
+  verify.py     preflight: checks Pulse, the token, and channel permissions
 tests/
   fixture.html  markup copied verbatim from the live page
   test_pulsebot.py
