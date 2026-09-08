@@ -1,0 +1,92 @@
+name: Pulse to Telegram
+
+on:
+  schedule:
+    # Every 5 minutes - the shortest interval GitHub Actions accepts.
+    # In practice GitHub delays scheduled runs under load (sometimes by
+    # 10-20 minutes) and occasionally skips one. That only affects latency,
+    # never correctness: Pulse's homepage holds ~24 hours of articles and
+    # the bot deduplicates by article id, so a late run simply catches up.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print messages instead of sending them'
+        type: boolean
+        default: false
+      reset_state:
+        description: 'Ignore saved state and re-seed from the current page'
+        type: boolean
+        default: false
+
+# Serialize runs. Two overlapping runs would each read the same state and
+# post the same articles twice.
+concurrency:
+  group: pulse-to-telegram
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore posted-article state
+        if: ${{ github.event.inputs.reset_state != 'true' }}
+        run: |
+          mkdir -p state
+          # State lives on its own orphan branch so the main branch history
+          # stays clean despite ~288 updates a day.
+          if git fetch --depth=1 origin state 2>/dev/null; then
+            git show FETCH_HEAD:seen.json > state/seen.json
+            echo "Restored $(python -c 'import json;print(len(json.load(open("state/seen.json"))["seen_ids"]))') seen ids."
+          else
+            echo "No state branch yet - this will be a seeding run."
+          fi
+
+      - name: Scrape Pulse and post new articles
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          STATE_PATH: state/seen.json
+          MAX_PER_RUN: '40'
+        run: python -m pulsebot.main
+
+      - name: Save posted-article state
+        # Run even if posting partially failed, so successfully sent articles
+        # are never sent a second time.
+        if: ${{ always() && hashFiles('state/seen.json') != '' && github.event.inputs.dry_run != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cp state/seen.json "$work/seen.json"
+          cd "$work"
+          git init -q
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen.json
+          git commit -q -m "State: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          # Force-push a fresh single-commit history: the state branch never
+          # grows, no matter how many times a day it is written.
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            HEAD:refs/heads/state
+          echo "State saved to the 'state' branch."
