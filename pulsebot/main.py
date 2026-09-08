@@ -22,6 +22,9 @@ def setup_logging() -> None:
 
 log = logging.getLogger("pulsebot")
 
+# How many articles a dry run renders, so a cold start stays readable.
+DRY_RUN_PREVIEW = 5
+
 
 def run() -> int:
     cfg = Config.from_env()
@@ -32,6 +35,28 @@ def run() -> int:
 
     if not new:
         log.info("No new articles (%d on page, all already seen)", len(articles))
+        return 0
+
+    # Pulse lists newest first; post oldest first so the channel reads
+    # chronologically top to bottom.
+    new.sort(key=lambda a: (a.published is not None, a.published, a.id))
+
+    # A dry run must never mutate state and never take the seeding shortcut -
+    # otherwise a cold-start preview would print nothing at all and silently
+    # mark the backlog as seen.
+    if cfg.dry_run:
+        preview = new[-DRY_RUN_PREVIEW:]
+        log.info(
+            "[DRY RUN] %d new article(s); previewing the newest %d. Nothing is sent "
+            "and no state is written.", len(new), len(preview),
+        )
+        if store.is_first_run:
+            log.info(
+                "[DRY RUN] This is a cold start: on a real run these would be seeded "
+                "silently rather than posted."
+            )
+        for a in preview:
+            log.info("[DRY RUN] would post:\n%s\n%s", render(a), "-" * 60)
         return 0
 
     # First run: remember everything on the page but post nothing, so the
@@ -46,10 +71,6 @@ def run() -> int:
         )
         return 0
 
-    # Pulse lists newest first; post oldest first so the channel reads
-    # chronologically top to bottom.
-    new.sort(key=lambda a: (a.published is not None, a.published, a.id))
-
     if len(new) > cfg.max_per_run:
         log.warning(
             "%d new articles exceeds MAX_PER_RUN=%d; posting the %d most recent "
@@ -60,11 +81,6 @@ def run() -> int:
         store.mark(skipped)
 
     log.info("Posting %d new article(s)", len(new))
-
-    if cfg.dry_run:
-        for a in new:
-            log.info("[DRY RUN] would post:\n%s\n%s", render(a), "-" * 60)
-        return 0
 
     publisher = TelegramPublisher(cfg.bot_token, cfg.chat_id)
     posted = failed = 0

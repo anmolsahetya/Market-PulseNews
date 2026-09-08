@@ -80,8 +80,10 @@ python -m unittest discover -s tests -v   # 19 tests, offline
 DRY_RUN=1 python -m pulsebot.main         # hits Pulse, prints, sends nothing
 ```
 
-The dry run should print a few rendered messages. This proves Pulse is
-reachable and the markup still parses.
+The dry run prints the newest few rendered messages and proves Pulse is
+reachable and the markup still parses. It never sends anything and never
+writes state, so it is safe to run repeatedly — including on a cold start,
+where it previews rather than seeding.
 
 ### Stage 2 — Preflight the whole chain
 
@@ -235,7 +237,7 @@ All settings come from environment variables.
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | *(required)* | BotFather token |
 | `TELEGRAM_CHAT_ID` | *(required)* | `@channel` or `-100…` |
-| `DRY_RUN` | `0` | `1` prints messages instead of sending |
+| `DRY_RUN` | `0` | `1` previews the newest few messages; sends nothing, writes no state |
 | `SEED_ON_FIRST_RUN` | `true` | First run records the backlog silently |
 | `MAX_PER_RUN` | `40` | Flood guard |
 | `STATE_PATH` | `state/seen.json` | Where the seen-id set is stored |

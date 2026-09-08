@@ -1,6 +1,7 @@
 """Tests run against markup copied verbatim from the live Pulse page."""
 
 import json
+import os
 import sys
 import unittest
 from datetime import datetime
@@ -155,6 +156,56 @@ class TestSeenStore(unittest.TestCase):
         s = SeenStore(self.path).load()
         self.assertTrue(s.is_first_run)
         self.assertEqual(s.ids, set())
+
+
+class TestDryRun(unittest.TestCase):
+    """A dry run must preview articles and never write state.
+
+    Regression: on a cold start the seeding shortcut used to return before
+    printing anything, so `DRY_RUN=1 python -m pulsebot.main` showed the user
+    no preview at all - and silently marked the backlog as seen.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.state = Path(self.dir.name) / "seen.json"
+        self.fixture = FIXTURE
+
+    def tearDown(self):
+        self.dir.cleanup()
+        for k in ("DRY_RUN", "STATE_PATH", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+            os.environ.pop(k, None)
+
+    def _run(self):
+        import logging, io
+        import pulsebot.main as m
+        import pulsebot.scraper as scraper
+        os.environ["DRY_RUN"] = "1"
+        os.environ["STATE_PATH"] = str(self.state)
+        m.scrape = lambda *a, **k: scraper.parse(self.fixture)
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        logger = logging.getLogger("pulsebot")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            rc = m.run()
+        finally:
+            logger.removeHandler(handler)
+        return rc, buf.getvalue()
+
+    def test_cold_start_dry_run_previews_and_writes_nothing(self):
+        rc, out = self._run()
+        self.assertEqual(rc, 0)
+        self.assertIn("would post", out)          # the user actually sees a preview
+        self.assertIn("cold start", out)          # and is told it is a cold start
+        self.assertFalse(self.state.exists(), "dry run must not write a state file")
+
+    def test_dry_run_preview_is_capped(self):
+        from pulsebot.main import DRY_RUN_PREVIEW
+        _, out = self._run()
+        self.assertLessEqual(out.count("would post"), DRY_RUN_PREVIEW)
 
 
 if __name__ == "__main__":
