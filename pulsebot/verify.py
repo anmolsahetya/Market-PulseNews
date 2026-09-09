@@ -15,6 +15,7 @@ import sys
 
 import requests
 
+from .config import parse_chat_ids
 from .scraper import PULSE_URL, fetch, parse
 from .telegram import API_BASE, render
 
@@ -81,15 +82,10 @@ def check_bot(token: str) -> str | None:
 
 
 def check_channel(token: str, chat_id: str, bot_username: str | None) -> bool:
-    print("\n3. Channel access")
-    if not chat_id:
-        _line(BAD, "TELEGRAM_CHAT_ID is not set")
-        return False
-
     r = requests.get(f"{API_BASE}/bot{token}/getChat", params={"chat_id": chat_id}, timeout=20)
     if r.status_code != 200:
         body = r.text.lower()
-        _line(BAD, f"Cannot see chat {chat_id!r} (HTTP {r.status_code})")
+        _line(BAD, f"{chat_id}: cannot see this chat (HTTP {r.status_code})")
         if "chat not found" in body:
             _line("", "  Either the id is wrong, or the bot has not been added to the channel.")
             _line("", "  Public channel: use @yourchannelname")
@@ -97,7 +93,7 @@ def check_channel(token: str, chat_id: str, bot_username: str | None) -> bool:
         return False
 
     chat = r.json()["result"]
-    _line(OK, f"Found {chat.get('type')} {chat.get('title') or chat.get('username')!r}")
+    _line(OK, f"{chat_id}: found {chat.get('type')} {chat.get('title') or chat.get('username')!r}")
 
     # Confirm the bot is an administrator that may post.
     if bot_username:
@@ -110,20 +106,19 @@ def check_channel(token: str, chat_id: str, bot_username: str | None) -> bool:
             member = me.json()["result"]
             status = member.get("status")
             if status not in ("administrator", "creator"):
-                _line(BAD, f"Bot is '{status}', not an administrator - it cannot post.")
+                _line(BAD, f"{chat_id}: bot is '{status}', not an administrator - it cannot post.")
                 _line("", "  Channel > Manage Channel > Administrators > Add your bot.")
                 return False
             if status == "administrator" and member.get("can_post_messages") is False:
-                _line(BAD, "Bot is an admin but lacks the 'Post Messages' permission.")
+                _line(BAD, f"{chat_id}: bot is an admin but lacks 'Post Messages'.")
                 return False
-            _line(OK, f"Bot is {status} with permission to post")
+            _line(OK, f"{chat_id}: bot is {status} with permission to post")
     return True
 
 
-def send_test(token: str, chat_id: str) -> bool:
-    print("\n4. Test message")
+def send_test(token: str, chat_ids: list[str]) -> bool:
     from .scraper import Article
-    from .telegram import TelegramPublisher
+    from .telegram import ChannelError, TelegramPublisher
 
     sample = Article(
         id=0,
@@ -134,17 +129,28 @@ def send_test(token: str, chat_id: str) -> bool:
         source="Setup check",
         published=None,
     )
-    if TelegramPublisher(token, chat_id).send(render(sample)):
-        _line(OK, "Test message delivered - check your channel")
-        return True
-    _line(BAD, "Test message was not delivered (see the error above)")
-    return False
+    publisher = TelegramPublisher(token)
+    all_ok = True
+    for chat_id in chat_ids:
+        try:
+            ok = publisher.post_article(chat_id, sample)
+        except ChannelError as exc:
+            _line(BAD, str(exc))
+            all_ok = False
+            continue
+        if ok:
+            _line(OK, f"{chat_id}: test message delivered")
+        else:
+            _line(BAD, f"{chat_id}: test message was not delivered")
+            all_ok = False
+    return all_ok
 
 
 def main() -> None:
     send = "--send" in sys.argv
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    raw = os.environ.get("TELEGRAM_CHAT_IDS") or os.environ.get("TELEGRAM_CHAT_ID") or ""
+    chat_ids = parse_chat_ids(raw)
 
     print("=" * 64)
     print("  Pulse → Telegram preflight")
@@ -153,18 +159,30 @@ def main() -> None:
     results = [check_pulse()]
     username = check_bot(token)
     results.append(username is not None)
-    if username:
-        ok = check_channel(token, chat_id, username)
-        results.append(ok)
-        if ok and send:
-            results.append(send_test(token, chat_id))
-        elif ok:
-            print("\n4. Test message")
-            _line(WARN, "Skipped. Re-run with --send to post one real test message.")
+
+    print(f"\n3. Channel access ({len(chat_ids)} configured)")
+    if not chat_ids:
+        _line(BAD, "TELEGRAM_CHAT_IDS is not set")
+        results.append(False)
+    elif username:
+        reachable = []
+        for chat_id in chat_ids:
+            ok = check_channel(token, chat_id, username)
+            results.append(ok)
+            if ok:
+                reachable.append(chat_id)
+
+        print("\n4. Test message")
+        if send and reachable:
+            results.append(send_test(token, reachable))
+        elif reachable:
+            _line(WARN, f"Skipped. Re-run with --send to post to {len(reachable)} channel(s).")
+        else:
+            _line(BAD, "No reachable channels to test.")
 
     print("\n" + "=" * 64)
     if all(results):
-        print("  All checks passed. Safe to enable the schedule.")
+        print(f"  All checks passed for {len(chat_ids)} channel(s). Safe to enable the schedule.")
         sys.exit(0)
     print("  Some checks failed - fix the items marked FAIL above.")
     sys.exit(1)

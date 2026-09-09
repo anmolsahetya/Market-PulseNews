@@ -1,7 +1,7 @@
 # Pulse → Telegram
 
 Scrapes [pulse.zerodha.com](https://pulse.zerodha.com/) every 5 minutes and posts each new
-article to a Telegram channel as its own message.
+article as its own message to **one or more** Telegram channels.
 
 ---
 
@@ -49,7 +49,7 @@ In the repo: **Settings → Secrets and variables → Actions → New repository
 | Name | Value |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | the token from BotFather |
-| `TELEGRAM_CHAT_ID` | `@yourchannel` or `-100…` |
+| `TELEGRAM_CHAT_IDS` | `@chan1,@chan2,-1001234567890` — one or many |
 
 Add these through the GitHub web UI yourself — never commit them to a file.
 
@@ -89,7 +89,7 @@ where it previews rather than seeding.
 
 ```bash
 export TELEGRAM_BOT_TOKEN='...'
-export TELEGRAM_CHAT_ID='@yourchannel'
+export TELEGRAM_CHAT_IDS='@chan1,@chan2'
 python -m pulsebot.verify
 ```
 
@@ -106,7 +106,7 @@ python -m pulsebot.verify --send
 
 ### Stage 3 — A throwaway channel first
 
-Point `TELEGRAM_CHAT_ID` at a private test channel and run the real thing:
+Point `TELEGRAM_CHAT_IDS` at a private test channel and run the real thing:
 
 ```bash
 python -m pulsebot.main   # first run: seeds, posts nothing
@@ -130,7 +130,7 @@ ids. If it doesn't, the save step failed — check the log for a push error.
 
 ### Stage 5 — Go live
 
-Swap `TELEGRAM_CHAT_ID` to the real channel, delete the `state` branch so it
+Swap `TELEGRAM_CHAT_IDS` to the real channel(s), delete the `state` branch so it
 re-seeds cleanly against the new channel, and let the schedule take over.
 
 > Deleting the `state` branch matters: state carried over from the test
@@ -166,6 +166,80 @@ If the channel feels too noisy once it's live, the cheapest fix is filtering
 by source in `pulsebot/main.py` — Pulse only carries 5 (The Hindu Business,
 Economic Times, NDTV Business, Business Standard, Finshots), so dropping one
 or two meaningfully cuts volume.
+
+---
+
+## Multiple channels
+
+Set `TELEGRAM_CHAT_IDS` to a comma-separated list. Every channel receives the
+same articles.
+
+```
+TELEGRAM_CHAT_IDS=@Market_PulseNews,@SecondChannel,-1001234567890
+```
+
+Adding or removing a channel is a secret edit — no code change, no deploy.
+Commas, newlines and spaces all work as separators, blanks are ignored, and a
+channel listed twice is de-duplicated (otherwise it would receive everything
+twice). `TELEGRAM_CHAT_ID` singular is still honoured, so an existing
+single-channel setup keeps working untouched.
+
+**The bot must be an administrator with "Post Messages" in every channel.**
+`python -m pulsebot.verify` checks each one individually and names any that fail.
+
+### State is per channel
+
+`seen.json` keeps a separate set of posted article ids for each channel:
+
+```json
+{
+  "version": 2,
+  "channels": {
+    "@Market_PulseNews": { "seen_ids": [...], "count": 306 },
+    "@SecondChannel":    { "seen_ids": [...], "count": 306 }
+  }
+}
+```
+
+This is not incidental. A single shared set would break in three ways:
+
+- A channel **added later** would be instantly "caught up" and never receive anything.
+- If a send **succeeds for channel A and fails for channel B**, marking the article
+  seen globally means **B loses it permanently** — silent, invisible data loss.
+- Channels fail independently in practice: the bot gets removed from one, loses
+  its post permission in another, or one chat hits a rate limit.
+
+Per-channel state means each channel advances only on its own successful sends,
+so a channel that was broken for an hour receives everything it missed once fixed.
+
+An older single-channel `seen.json` is migrated automatically: its ids become the
+starting baseline for every configured channel.
+
+### A newly added channel seeds, it does not backfill
+
+The first run that sees a new channel records the ~300 articles currently on the
+page as "seen" and posts nothing to it. From the next run it receives new
+articles like every other channel. This stops a new channel getting a day's
+backlog dumped into it at once. Set `SEED_ON_FIRST_RUN=false` if you'd rather it
+did backfill.
+
+### One broken channel does not stop the rest
+
+A channel that can't be posted to (wrong id, bot not an admin, permission
+revoked) is logged, skipped, and the run continues to the other channels. The
+run then exits non-zero so GitHub marks it failed and emails you — a channel
+silently going dark is worse than a red build. A bad **bot token**, by contrast,
+affects everything, so it aborts immediately.
+
+### Volume and rate limits
+
+Messages per run = new articles × channels. Telegram's ~20 messages/minute limit
+is **per chat**, so the publisher tracks a separate clock for each channel —
+adding channels doesn't slow down the ones you already have. A separate small
+floor between any two sends keeps the bot under its global ~30/second cap.
+
+At Pulse's ~1–2 new articles per 5-minute run, ten channels is about 20 messages
+per run, comfortably within limits.
 
 ---
 
@@ -236,7 +310,7 @@ All settings come from environment variables.
 | Variable | Default | Purpose |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | *(required)* | BotFather token |
-| `TELEGRAM_CHAT_ID` | *(required)* | `@channel` or `-100…` |
+| `TELEGRAM_CHAT_IDS` | *(required)* | Comma-separated channels; all receive the same articles |
 | `DRY_RUN` | `0` | `1` previews the newest few messages; sends nothing, writes no state |
 | `SEED_ON_FIRST_RUN` | `true` | First run records the backlog silently |
 | `MAX_PER_RUN` | `40` | Flood guard |
@@ -257,7 +331,7 @@ DRY_RUN=1 python -m pulsebot.main
 
 # Post for real
 export TELEGRAM_BOT_TOKEN='...'
-export TELEGRAM_CHAT_ID='@yourchannel'
+export TELEGRAM_CHAT_IDS='@chan1,@chan2'
 python -m pulsebot.main
 ```
 
@@ -291,9 +365,9 @@ share the channel publicly, credit Pulse as the source.
 pulsebot/
   scraper.py    fetch + parse Pulse HTML into Article objects
   telegram.py   render + send via the Bot API, with retries and throttling
-  state.py      bounded seen-id set, persisted as JSON
+  state.py      bounded per-channel seen-id sets, persisted as JSON
   config.py     environment-variable configuration
-  main.py       entry point: scrape → diff → post → persist
+  main.py       entry point: scrape → per-channel diff → post → persist
   verify.py     preflight: checks Pulse, the token, and channel permissions
 tests/
   fixture.html  markup copied verbatim from the live page

@@ -7,7 +7,12 @@ from repository Secrets; locally, export them in your shell.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
+
+# Channels may be separated by commas, newlines or whitespace, so a secret
+# can be pasted as one line or as a list.
+_SPLIT = re.compile(r"[,\s]+")
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -17,42 +22,70 @@ def _flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def parse_chat_ids(raw: str) -> list[str]:
+    """Split a chat-id list, dropping blanks and duplicates, keeping order.
+
+    Duplicates matter: the same channel listed twice would receive every
+    article twice, since each send is a separate API call.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in _SPLIT.split(raw or ""):
+        part = part.strip()
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        out.append(part)
+    return out
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
-    chat_id: str
-    state_path: str
-    dry_run: bool
-    seed_on_first_run: bool
-    max_per_run: int
+    chat_ids: list[str] = field(default_factory=list)
+    state_path: str = "state/seen.json"
+    dry_run: bool = False
+    seed_on_first_run: bool = True
+    max_per_run: int = 40
+
+    @property
+    def chat_id(self) -> str:
+        """The first channel - kept for single-channel callers."""
+        return self.chat_ids[0] if self.chat_ids else ""
 
     @classmethod
     def from_env(cls) -> "Config":
         dry_run = _flag("DRY_RUN", False)
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+        # TELEGRAM_CHAT_IDS is the multi-channel form; TELEGRAM_CHAT_ID is
+        # still accepted so an existing single-channel setup keeps working.
+        raw = os.environ.get("TELEGRAM_CHAT_IDS") or os.environ.get("TELEGRAM_CHAT_ID") or ""
+        chat_ids = parse_chat_ids(raw)
 
         if not dry_run:
-            missing = [
-                n for n, v in (("TELEGRAM_BOT_TOKEN", token), ("TELEGRAM_CHAT_ID", chat_id)) if not v
-            ]
+            missing = []
+            if not token:
+                missing.append("TELEGRAM_BOT_TOKEN")
+            if not chat_ids:
+                missing.append("TELEGRAM_CHAT_IDS")
             if missing:
                 raise SystemExit(
                     "Missing required environment variable(s): "
                     + ", ".join(missing)
                     + "\nSet them as GitHub repository Secrets, or export them locally. "
+                    "TELEGRAM_CHAT_IDS accepts several channels separated by commas. "
                     "Use DRY_RUN=1 to test the scraper without posting."
                 )
 
         return cls(
             bot_token=token,
-            chat_id=chat_id,
+            chat_ids=chat_ids,
             state_path=os.environ.get("STATE_PATH", "state/seen.json"),
             dry_run=dry_run,
-            # First run seeds the store instead of dumping ~300 backlogged
-            # articles into the channel.
+            # A newly added channel seeds instead of receiving the ~300
+            # article backlog currently on the page.
             seed_on_first_run=_flag("SEED_ON_FIRST_RUN", True),
-            # A safety valve: if something goes wrong upstream and the diff
-            # explodes, don't flood the channel.
+            # Flood guard, applied per channel.
             max_per_run=int(os.environ.get("MAX_PER_RUN", "40")),
         )
